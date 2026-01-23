@@ -1,0 +1,43 @@
+{
+    "name": "call-gateway",
+    "version": "1.0.0",
+    "description": "WebRTC signaling and call routing gateway",
+    "main": "dist/server.js",
+    "scripts": {
+        "dev": "tsnd --respawn --transpile-only src/server.ts",
+        "build": "tsc",
+        "start": "node dist/server.js"
+    },
+    "keywords": [
+        "webrtc",
+        "signaling",
+        "call-routing"
+    ],
+    "author": "",
+    "license": "MIT",
+    "dependencies": {
+        "@fastify/cors": "^8.4.2",
+        "@fastify/multipart": "^7.7.3",
+        "@fastify/static": "^9.0.0",
+        "@fastify/websocket": "^8.3.1",
+        "axios": "^1.6.2",
+        "dotenv": "^16.3.1",
+        "fastify": "^4.25.0",
+        "firebase-admin": "^12.7.0",
+        "form-data": "^4.0.5",
+        "ioredis": "^5.3.2",
+        "mongodb": "^7.0.0",
+        "pino": "^8.16.2",
+        "pino-pretty": "^10.2.3",
+        "socket.io": "^4.8.3",
+        "uuid": "^9.0.1",
+        "ws": "^8.19.0"
+    },
+    "devDependencies": {
+        "@types/node": "^20.10.0",
+        "@types/uuid": "^9.0.7",
+        "@types/ws": "^8.18.1",
+        "ts-node-dev": "^2.0.0",
+        "typescript": "^5.3.2"
+    }
+}
