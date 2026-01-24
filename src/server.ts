@@ -5,7 +5,7 @@ import { setupSocketIOServer } from './websocket/signalingServer';
 import { config } from './config';
 import pino from 'pino';
 import FastifyMultipart from '@fastify/multipart';
-import { transcribeAudio } from './services/whisperClient';
+// import { transcribeAudio } from './services/whisperClient';
 import PermissionService from './services/PermissionService';
 import AgentProxyService from './services/AgentProxyService';
 import WebSocket from 'ws';
@@ -76,6 +76,39 @@ const start = async () => {
                     message: permissions.calls
                         ? 'Calls allowed - would route to P2P'
                         : 'Calls blocked - would route to agent'
+                };
+            } catch (error: any) {
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
+        // Clear permission cache for specific user
+        fastify.post('/api/clear-cache/:empid', async (request, reply) => {
+            try {
+                const { empid } = request.params as { empid: string };
+                PermissionService.clearCache(empid);
+                return {
+                    success: true,
+                    message: `Cache cleared for empid: ${empid}`
+                };
+            } catch (error: any) {
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
+        // Clear all permission cache
+        fastify.post('/api/clear-cache', async (request, reply) => {
+            try {
+                PermissionService.clearAllCache();
+                return {
+                    success: true,
+                    message: 'All cache cleared'
                 };
             } catch (error: any) {
                 return {
@@ -310,79 +343,79 @@ const start = async () => {
 
 
         // Whisper audio transcription endpoint
-        fastify.post('/api/transcribe-audio', async (request, reply) => {
-            try {
-                const data = await request.file();
+        // fastify.post('/api/transcribe-audio', async (request, reply) => {
+        //     try {
+        //         const data = await request.file();
 
-                if (!data) {
-                    reply.code(400);
-                    return { error: 'No audio file provided' };
-                }
+        //         if (!data) {
+        //             reply.code(400);
+        //             return { error: 'No audio file provided' };
+        //         }
 
-                const callId = (data.fields.callId as any)?.value || 'unknown';
-                const userId = (data.fields.userId as any)?.value || 'unknown';
+        //         const callId = (data.fields.callId as any)?.value || 'unknown';
+        //         const userId = (data.fields.userId as any)?.value || 'unknown';
 
-                logger.info({ callId, userId }, 'Received audio for transcription');
+        //         logger.info({ callId, userId }, 'Received audio for transcription');
 
-                // Save uploaded file temporarily
-                const tempPath = `./temp_${Date.now()}.m4a`;
-                const fs = require('fs');
-                const writeStream = fs.createWriteStream(tempPath);
-                data.file.pipe(writeStream);
+        //         // Save uploaded file temporarily
+        //         const tempPath = `./temp_${Date.now()}.m4a`;
+        //         const fs = require('fs');
+        //         const writeStream = fs.createWriteStream(tempPath);
+        //         data.file.pipe(writeStream);
 
-                await new Promise((resolve, reject) => {
-                    writeStream.on('finish', resolve);
-                    writeStream.on('error', reject);
-                });
+        //         await new Promise((resolve, reject) => {
+        //             writeStream.on('finish', resolve);
+        //             writeStream.on('error', reject);
+        //         });
 
-                try {
-                    // Transcribe using Whisper
-                    const result = await transcribeAudio(tempPath);
+        //         try {
+        //             // Transcribe using Whisper
+        //             const result = await transcribeAudio(tempPath);
 
-                    logger.info({
-                        callId,
-                        userId,
-                        transcriptLength: result.text.length,
-                        language: result.language
-                    }, 'Audio transcribed successfully');
+        //             logger.info({
+        //                 callId,
+        //                 userId,
+        //                 transcriptLength: result.text.length,
+        //                 language: result.language
+        //             }, 'Audio transcribed successfully');
 
-                    // Log the transcript
-                    console.log('='.repeat(60));
-                    console.log(`[WHISPER TRANSCRIPT] User: ${userId}`);
-                    console.log(`[CALL ID] ${callId}`);
-                    console.log(`[LANGUAGE] ${result.language}`);
-                    console.log(`[TEXT] ${result.text}`);
-                    console.log('='.repeat(60));
+        //             // Log the transcript
+        //             console.log('='.repeat(60));
+        //             console.log(`[WHISPER TRANSCRIPT] User: ${userId}`);
+        //             console.log(`[CALL ID] ${callId}`);
+        //             console.log(`[LANGUAGE] ${result.language}`);
+        //             console.log(`[TEXT] ${result.text}`);
+        //             console.log('='.repeat(60));
 
-                    // TODO: Forward to AI server
-                    // await aiServerClient.sendConversationTranscript({
-                    //     callId, userId, transcript: result.text, language: result.language
-                    // });
+        //             // TODO: Forward to AI server
+        //             // await aiServerClient.sendConversationTranscript({
+        //             //     callId, userId, transcript: result.text, language: result.language
+        //             // });
 
-                    // Clean up temp file
-                    fs.unlinkSync(tempPath);
+        //             // Clean up temp file
+        //             fs.unlinkSync(tempPath);
 
-                    return {
-                        success: true,
-                        text: result.text,
-                        language: result.language
-                    };
-                } catch (error: any) {
-                    // Clean up temp file on error
-                    if (fs.existsSync(tempPath)) {
-                        fs.unlinkSync(tempPath);
-                    }
+        //             return {
+        //                 success: true,
+        //                 text: result.text,
+        //                 language: result.language
+        //             };
+        //         } catch (error: any) {
+        //             // Clean up temp file on error
+        //             if (fs.existsSync(tempPath)) {
+        //                 fs.unlinkSync(tempPath);
+        //             }
 
-                    logger.error({ error: error.message }, 'Whisper transcription failed');
-                    reply.code(500);
-                    return { error: 'Transcription failed', details: error.message };
-                }
-            } catch (error: any) {
-                logger.error({ error: error.message }, 'Failed to process audio upload');
-                reply.code(500);
-                return { error: 'Failed to process audio upload' };
-            }
-        });
+        //             logger.error({ error: error.message }, 'Whisper transcription failed');
+        //             reply.code(500);
+        //             return { error: 'Transcription failed', details: error.message };
+        //         }
+        //     } catch (error: any) {
+        //         logger.error({ error: error.message }, 'Failed to process audio upload');
+        //         reply.code(500);
+        //         return { error: 'Failed to process audio upload' };
+        //     }
+        // })
 
         await fastify.listen({ port: config.port, host: '0.0.0.0' });
 
