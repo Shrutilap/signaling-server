@@ -5,7 +5,6 @@ import { setupSocketIOServer } from './websocket/signalingServer';
 import { config } from './config';
 import pino from 'pino';
 import FastifyMultipart from '@fastify/multipart';
-// import { transcribeAudio } from './services/whisperClient';
 import PermissionService from './services/PermissionService';
 import UserService from './services/UserService';
 import AgentProxyService from './services/AgentProxyService';
@@ -24,7 +23,7 @@ const logger = pino({
     }
 });
 
-const MONGO_URL = process.env.MONGODB_URL || 'mongodb://localhost:27017';
+
 
 // Start server
 const startServer = async () => {
@@ -35,7 +34,7 @@ const startServer = async () => {
     try {
         // Initialize Permission Service first
         console.log('[Server] Initializing PermissionService...');
-        await PermissionService.init(MONGO_URL, 'talker');
+        await PermissionService.init(config.mongodbUrl, 'talker');
         console.log('[Server] PermissionService initialized');
 
         // Get the database instance
