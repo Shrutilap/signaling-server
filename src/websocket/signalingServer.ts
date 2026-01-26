@@ -10,6 +10,8 @@ import { config } from '../config';
 import { sendPushNotification } from '../services/firebaseService';
 import PermissionService from '../services/PermissionService';
 import AgentProxyService from '../services/AgentProxyService';
+import UpdatesService from '../services/UpdatesService';
+import ConversationService from '../services/ConversationService';
 
 const logger = pino({ level: config.logLevel });
 
@@ -83,6 +85,44 @@ export function setupSocketIOServer(io: SocketIOServer): void {
             socket.emit('online-users', { users });
         });
 
+        // Mobile App - Agent Call Ended (with conversation stored)
+        // TODO: Re-enable when ConversationService.logConversation is implemented
+        /*
+        socket.on('agent-call-ended', async (data: { callId: string; recipientId: string; transcript?: string; summary?: string }) => {
+            const { callId, recipientId, transcript, summary } = data;
+
+            logger.info({ callId, recipientId, hasTranscript: !!transcript, hasSummary: !!summary }, 'Agent call ended, storing conversation');
+
+            try {
+                // Store the conversation
+                await ConversationService.logConversation({
+                    callId,
+                    recipientId,
+                    callerId: socket.id,
+                    transcript: transcript || '',
+                    summary: summary || 'Agent handled call',
+                    timestamp: new Date()
+                });
+
+                // Create update for the user
+                const callerUser = clientManager.getUserFromDirectory(socket.id);
+                await UpdatesService.createUpdate({
+                    userId: recipientId,
+                    type: 'agent-call',
+                    title: 'Agent handled call',
+                    message: summary || `Agent spoke with ${callerUser?.displayName || 'someone'} while you were unavailable`,
+                    relatedUserId: socket.id,
+                    relatedUserName: callerUser?.displayName || socket.id,
+                    metadata: { callId, transcript, summary }
+                });
+
+                logger.info({ callId, recipientId }, 'Conversation stored and update created successfully');
+            } catch (error) {
+                logger.error({ error, callId, recipientId }, 'Failed to store conversation or create update');
+            }
+        });
+        */
+
         // Mobile App - Initiate Call (with permission check)
         socket.on('call-user', async (data: { to: string; from: string; callId: string; callerName: string }) => {
             const { to, from, callId, callerName } = data;
@@ -106,11 +146,21 @@ export function setupSocketIOServer(io: SocketIOServer): void {
                     // Calls blocked → Route to agent
                     logger.info({ callId }, 'Routing to agent (calls blocked)');
 
+                    // Construct dynamic agent URL for the client
+                    // Base URL from config + query params for context
+                    // Construct dynamic agent URL for the client
+                    // Base URL from config + query params for context
+                    const baseHandlerUrl = "wss://agentserver-662251767689.asia-south1.run.app/talk_to_emp's_nimi/";
+                    // const baseHandlerUrl = config.agentServerUrl;
+                    const dynamicAgentUrl = `${baseHandlerUrl}?empid=${to}&calleremp=${from}`;
+
+                    console.log(`[Signaling] Constructed dynamic agent URL: ${dynamicAgentUrl}`);
+
                     // Notify caller they're being routed to agent
                     socket.emit('route-to-agent', {
                         callId,
                         recipientId: to,
-                        agentUrl: config.agentServerUrl,
+                        agentUrl: dynamicAgentUrl,
                     });
 
                     // Create proxy to agent server
@@ -240,10 +290,12 @@ export function setupSocketIOServer(io: SocketIOServer): void {
         });
 
         // Mobile App - Send Message
-        socket.on('send-message', async (data: { to: string; from: string; message: string; messageId: string; senderName: string }, ack) => {
-            const { to, from, message, messageId, senderName } = data;
+        socket.on('send-message', async (data: { to: string; from: string; message: string; senderName: string }, ack) => {
+            const { to, from, message, senderName } = data;
+            const messageId = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+            const timestamp = Date.now();
 
-            logger.info({ from, to, messageId }, 'Message received from sender');
+            logger.info({ from, to, messageLength: message.length, messageId }, 'Message send request received');
 
             const recipient = clientManager.getUserFromDirectory(to);
 
@@ -260,12 +312,27 @@ export function setupSocketIOServer(io: SocketIOServer): void {
                     senderName,
                     message,
                     messageId,
-                    timestamp: Date.now(),
+                    timestamp,
                 });
                 logger.info({ to, status: 'online', messageId }, 'Message delivered via socket');
                 if (ack) ack({ success: true, delivered: 'socket' });
             } else {
-                // User is offline, send push notification
+                // Recipient offline - log update and send push notification
+                logger.warn({ from, to, messageId }, 'Message sent to offline recipient');
+
+                // Create missed message update
+                const senderUser = clientManager.getUserFromDirectory(from);
+                await UpdatesService.createUpdate({
+                    userId: to,
+                    type: 'missed-message',
+                    title: 'New message',
+                    message: `${senderUser?.displayName || from}: ${message.substring(0, 50)}${message.length > 50 ? '...' : ''}`,
+                    relatedUserId: from,
+                    relatedUserName: senderUser?.displayName || from,
+                    metadata: { messageId, message }
+                });
+
+                // Send push notification if available
                 if (recipient.fcmToken) {
                     try {
                         const { sendMessageNotification } = require('../services/firebaseService');
@@ -286,6 +353,14 @@ export function setupSocketIOServer(io: SocketIOServer): void {
                     logger.error({ to, status: 'offline', messageId }, 'Message FAILED: recipient offline, no FCM token');
                     if (ack) ack({ success: false, error: 'Recipient offline and unreachable' });
                 }
+            }
+
+            // Log message to database (regardless of delivery method)
+            try {
+                await ConversationService.logMessage(from, to, message);
+                logger.info({ from, to, messageId }, 'Message logged to database');
+            } catch (error) {
+                logger.error({ error, messageId }, 'Failed to log message to database');
             }
         });
 

@@ -1,5 +1,6 @@
 import WebSocket from 'ws';
 import { Socket } from 'socket.io';
+import ConversationService from './ConversationService';
 
 interface CallData {
     from: string;
@@ -10,40 +11,30 @@ interface CallData {
 
 class AgentProxyService {
     private activeProxies = new Map<string, WebSocket>();
-    private agentServerUrl: string = '';
+    private baseAgentUrl: string | null = null;
 
     setAgentServerUrl(url: string) {
-        this.agentServerUrl = url;
-        console.log('[AgentProxy] Agent server URL set:', url);
+        // Store base URL without query params
+        this.baseAgentUrl = url;
+        console.log('[AgentProxy] Base agent server URL set:', url);
     }
 
     async createProxy(clientSocket: Socket, callData: CallData) {
-        if (!this.agentServerUrl) {
+        if (!this.baseAgentUrl) {
             console.error('[AgentProxy] Agent server URL not configured');
             return;
         }
 
-        // Build agent WebSocket URL safely
-        let agentUrlObj: URL;
-        try {
-            // Handle if the base URL already has query params or path
-            agentUrlObj = new URL(this.agentServerUrl);
+        // Build dynamic agent URL: empid = recipient (being called), calleremp = caller
+        const agentUrl = `${this.baseAgentUrl}?empid=${callData.to}&calleremp=${callData.from}`;
 
-            // Append call data as query params without overwriting existing ones
-            agentUrlObj.searchParams.append('callerId', callData.from);
-            agentUrlObj.searchParams.append('recipientId', callData.to);
-            agentUrlObj.searchParams.append('callId', callData.callId);
-            agentUrlObj.searchParams.append('callerName', callData.callerName);
+        console.log(`[AgentProxy] Creating proxy to agent for call ${callData.callId}`);
+        console.log(`[AgentProxy] Recipient: ${callData.to}, Caller: ${callData.from}`);
+        console.log(`[AgentProxy] Agent URL: ${agentUrl}`);
+        console.log(`[AgentProxy] EXACT RESOLVED URL: ${agentUrl}`);
 
-            console.log(`[AgentProxy] Creating proxy to agent for call ${callData.callId}`);
-            console.log(`[AgentProxy] Agent URL: ${agentUrlObj.toString()}`);
 
-        } catch (error) {
-            console.error('[AgentProxy] Invalid Agent URL:', this.agentServerUrl, error);
-            return;
-        }
-
-        const agentWs = new WebSocket(agentUrlObj.toString());
+        const agentWs = new WebSocket(agentUrl);
         this.activeProxies.set(callData.callId, agentWs);
 
         agentWs.on('open', () => {
@@ -71,11 +62,20 @@ class AgentProxyService {
         });
 
         // Mobile → Agent: Relay text
-        clientSocket.on('agent-text', (data: { callId: string; message: string }) => {
+        clientSocket.on('agent-text', async (data: { callId: string; message: string }) => {
             if (data.callId !== callData.callId) return;
 
             if (agentWs.readyState === WebSocket.OPEN) {
                 console.log(`[AgentProxy] Relaying text to agent: ${data.message}`);
+
+                // Log user message to agent in database
+                try {
+                    await ConversationService.logMessage(callData.from, 'agent', data.message);
+                    console.log(`[AgentProxy] User message logged to database`);
+                } catch (error) {
+                    console.error('[AgentProxy] Failed to log user message:', error);
+                }
+
                 agentWs.send(JSON.stringify({
                     type: 'text',
                     data: data.message,
@@ -84,7 +84,7 @@ class AgentProxyService {
         });
 
         // Agent → Mobile: Relay responses
-        agentWs.on('message', (data) => {
+        agentWs.on('message', async (data) => {
             try {
                 const msg = JSON.parse(data.toString());
 
@@ -95,6 +95,15 @@ class AgentProxyService {
                     });
                 } else if (msg.type === 'text') {
                     console.log(`[AgentProxy] Relaying agent text to mobile: ${msg.data}`);
+
+                    // Log agent message to database
+                    try {
+                        await ConversationService.logMessage('agent', callData.from, msg.data);
+                        console.log(`[AgentProxy] Agent message logged to database`);
+                    } catch (error) {
+                        console.error('[AgentProxy] Failed to log agent message:', error);
+                    }
+
                     clientSocket.emit('agent-text-response', {
                         callId: callData.callId,
                         message: msg.data,

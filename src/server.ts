@@ -7,7 +7,10 @@ import pino from 'pino';
 import FastifyMultipart from '@fastify/multipart';
 // import { transcribeAudio } from './services/whisperClient';
 import PermissionService from './services/PermissionService';
+import UserService from './services/UserService';
 import AgentProxyService from './services/AgentProxyService';
+import ConversationService from './services/ConversationService';
+import UpdatesService from './services/UpdatesService';
 import WebSocket from 'ws';
 
 
@@ -21,17 +24,34 @@ const logger = pino({
     }
 });
 
+const MONGO_URL = process.env.MONGODB_URL || 'mongodb://localhost:27017';
+
 // Start server
-const start = async () => {
+const startServer = async () => {
     const fastify = Fastify({
         logger: logger as any
     });
 
     try {
-        // Initialize Permission Service with MongoDB
+        // Initialize Permission Service first
         console.log('[Server] Initializing PermissionService...');
-        await PermissionService.init(config.mongodbUrl, 'talker');
+        await PermissionService.init(MONGO_URL, 'talker');
         console.log('[Server] PermissionService initialized');
+
+        // Get the database instance
+        const db = (PermissionService as any).db;
+
+        // Initialize UserService with the same db instance
+        UserService.init(db);
+        console.log('[Server] UserService initialized');
+
+        // Initialize ConversationService
+        ConversationService.init(db);
+        console.log('[Server] ConversationService initialized');
+
+        // Initialize UpdatesService
+        UpdatesService.init(db);
+        console.log('[Server] UpdatesService initialized');
 
         // Initialize Agent Proxy Service with agent server URL
         AgentProxyService.setAgentServerUrl(config.agentServerUrl);
@@ -206,9 +226,216 @@ const start = async () => {
             };
         });
 
+        // Get all users from database
+        fastify.get('/api/db-users', async (request, reply) => {
+            try {
+                const users = await UserService.getAllUsers();
+                return {
+                    success: true,
+                    totalUsers: users.length,
+                    users: users
+                };
+            } catch (error: any) {
+                reply.code(500);
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
+        // Get conversation history by conversationId
+        fastify.get('/api/conversations/:conversationId', async (request, reply) => {
+            try {
+                const { conversationId } = request.params as { conversationId: string };
+                const conversation = await ConversationService.getConversation(conversationId);
+
+                if (!conversation) {
+                    reply.code(404);
+                    return {
+                        success: false,
+                        error: 'Conversation not found'
+                    };
+                }
+
+                return {
+                    success: true,
+                    conversation
+                };
+            } catch (error: any) {
+                reply.code(500);
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
+        // Get all conversations for a user
+        fastify.get('/api/users/:userId/conversations', async (request, reply) => {
+            try {
+                const { userId } = request.params as { userId: string };
+                const conversations = await ConversationService.getConversationsByUser(userId);
+
+                return {
+                    success: true,
+                    totalConversations: conversations.length,
+                    conversations
+                };
+            } catch (error: any) {
+                reply.code(500);
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
+        // Get messages between two users for mobile app sync
+        fastify.get('/api/messages/:userId1/:userId2', async (request, reply) => {
+            try {
+                const { userId1, userId2 } = request.params as { userId1: string; userId2: string };
+
+                // Generate conversation ID (same logic as ConversationService)
+                const conversationId = [userId1, userId2].sort().join('_');
+                const conversation = await ConversationService.getConversation(conversationId);
+
+                if (!conversation) {
+                    return {
+                        success: true,
+                        messages: [],
+                        conversationId
+                    };
+                }
+
+                return {
+                    success: true,
+                    messages: conversation.messages,
+                    conversationId: conversation.conversationId
+                };
+            } catch (error: any) {
+                reply.code(500);
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
+        // Get user permissions
+        fastify.get('/api/permissions/:userId', async (request, reply) => {
+            try {
+                const { userId } = request.params as { userId: string };
+                const permissions = await PermissionService.getUserPermissions(userId);
+
+                return {
+                    success: true,
+                    permissions: {
+                        calls: permissions.calls,
+                        messages: permissions.messages
+                    }
+                };
+            } catch (error: any) {
+                reply.code(500);
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
+        // Update user permissions
+        fastify.put('/api/permissions/:userId', async (request, reply) => {
+            try {
+                const { userId } = request.params as { userId: string };
+                const { calls, messages } = request.body as { calls: boolean; messages: boolean };
+
+                await PermissionService.updatePermissions(userId, { calls, messages });
+
+                return {
+                    success: true,
+                    message: 'Permissions updated successfully'
+                };
+            } catch (error: any) {
+                reply.code(500);
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
+        // Update user availability status
+        fastify.put('/api/users/:userId/availability', async (request, reply) => {
+            try {
+                const { userId } = request.params as { userId: string };
+                const { availability } = request.body as { availability: string };
+
+                await UserService.updateAvailability(userId, availability);
+
+                return {
+                    success: true,
+                    message: 'Availability updated successfully'
+                };
+            } catch (error: any) {
+                reply.code(500);
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
+        // Get updates for a user
+        fastify.get('/api/updates/:userId', async (request, reply) => {
+            try {
+                const { userId } = request.params as { userId: string };
+                const { limit } = request.query as { limit?: string };
+
+                const updates = await UpdatesService.getUpdates(
+                    userId,
+                    limit ? parseInt(limit) : 50
+                );
+                const unreadCount = await UpdatesService.getUnreadCount(userId);
+
+                return {
+                    success: true,
+                    updates,
+                    unreadCount
+                };
+            } catch (error: any) {
+                reply.code(500);
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
+        // Mark updates as read
+        fastify.post('/api/updates/:userId/mark-read', async (request, reply) => {
+            try {
+                const { userId } = request.params as { userId: string };
+                const { updateIds } = request.body as { updateIds: string[] };
+
+                await UpdatesService.markAsRead(userId, updateIds);
+
+                return {
+                    success: true,
+                    message: 'Updates marked as read'
+                };
+            } catch (error: any) {
+                reply.code(500);
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
         //test audio
         fastify.get('/api/test-agent-audio', async () => {
-            const agentUrl = 'ws://10.188.163.10:8080/nirmal/?projectid=9900';
+            const agentUrl = config.agentServerUrl || 'ws://10.188.163.10:8080/nirmal/?projectid=9900';
 
             return new Promise((resolve) => {
                 const ws = new WebSocket(agentUrl);
@@ -439,4 +666,24 @@ const start = async () => {
     }
 };
 
-start();
+const server = startServer();
+
+// Graceful Shutdown for Cloud Run
+const signalHandler = async (signal: string) => {
+    logger.info(`Received ${signal}. Shutting down gracefully...`);
+
+    // Perform cleanup here (e.g., close DB connections, socket disconnects)
+    try {
+        // If you have explicit close methods in your services, call them here
+        // e.g., await PermissionService.close();
+
+        logger.info('Cleanup complete. Exiting.');
+        process.exit(0);
+    } catch (err) {
+        logger.error({ err }, 'Error during graceful shutdown');
+        process.exit(1);
+    }
+};
+
+process.on('SIGTERM', () => signalHandler('SIGTERM'));
+process.on('SIGINT', () => signalHandler('SIGINT'));

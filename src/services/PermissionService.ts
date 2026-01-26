@@ -69,6 +69,36 @@ class PermissionService {
         this.cache.clear();
         console.log('[PermissionService] Cleared all cache');
     }
+
+    /**
+     * Update permissions for a user
+     */
+    async updatePermissions(
+        empid: string,
+        permissions: { calls: boolean; messages: boolean }
+    ): Promise<void> {
+        if (!this.db) {
+            throw new Error('PermissionService not initialized');
+        }
+
+        // Update in the users collection under botSettings.permissions
+        // to match where getUserPermissions reads from
+        await this.db.collection('users').updateOne(
+            { empid },
+            {
+                $set: {
+                    'botSettings.permissions.calls': permissions.calls,
+                    'botSettings.permissions.messages': permissions.messages,
+                    'botSettings.updatedAt': new Date()
+                }
+            }
+        );
+
+        // Clear cache for this user so next read gets fresh data
+        this.clearCache(empid);
+
+        console.log(`[PermissionService] Updated permissions for ${empid}:`, permissions);
+    }
 }
 
 export default new PermissionService();
