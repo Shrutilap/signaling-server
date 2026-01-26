@@ -1,22 +1,37 @@
-FROM node:18-alpine
+# Stage 1: Build
+FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Copy package files
+# Copy dependency files
 COPY package*.json ./
 COPY tsconfig.json ./
 
-# Install dependencies
-RUN npm install
+# Install all deps (including dev deps)
+RUN npm ci
 
-# Copy source code
-COPY src/ ./src/
+# Copy source
+COPY src ./src
+COPY public ./public
 
 # Build TypeScript
 RUN npm run build
 
-# Expose port
-EXPOSE 3000
+# Stage 2: Production runtime
+FROM node:20-alpine
 
-# Run the application
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV PORT=8080
+
+# Copy ONLY production node_modules from builder
+COPY --from=builder /app/node_modules ./node_modules
+
+# Copy built code
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/public ./public
+
+EXPOSE 8080
+
 CMD ["node", "dist/server.js"]
