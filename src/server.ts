@@ -385,6 +385,31 @@ const startServer = async () => {
             }
         });
 
+        // Get project updates (General attributes from Nirmal Server AI)
+        fastify.get('/api/project-updates', async (request, reply) => {
+            try {
+                const project = await db.collection('projects').findOne({ name: 'Nirmal Server AI' });
+
+                if (!project || !project.general) {
+                    return {
+                        success: true,
+                        updates: []
+                    };
+                }
+
+                return {
+                    success: true,
+                    updates: project.general
+                };
+            } catch (error: any) {
+                reply.code(500);
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
         // Get updates for a user
         fastify.get('/api/updates/:userId', async (request, reply) => {
             try {
