@@ -566,6 +566,71 @@ const startServer = async () => {
             };
         });
 
+        // Send message notification (FCM only, no sockets)
+        fastify.post('/api/notify/message', async (request, reply) => {
+            try {
+                const {
+                    recipientId,
+                    senderId,
+                    senderName,
+                    messageText,
+                    messageId
+                } = request.body as {
+                    recipientId: string;
+                    senderId: string;
+                    senderName: string;
+                    messageText: string;
+                    messageId: string;
+                };
+
+                if (!recipientId || !senderId || !messageText || !messageId) {
+                    reply.code(400);
+                    return {
+                        success: false,
+                        error: 'Missing required fields'
+                    };
+                }
+
+                // Get recipient from client directory
+                const { clientManager } = await import('./websocket/clientManager');
+                const recipient = clientManager.getUserFromDirectory(recipientId);
+
+                if (!recipient || !recipient.fcmToken) {
+                    reply.code(404);
+                    return {
+                        success: false,
+                        error: 'Recipient not found or has no FCM token'
+                    };
+                }
+
+                // Send FCM message notification
+                const { sendMessageNotification } = await import('./services/firebaseService');
+
+
+                await sendMessageNotification(
+                    recipient.fcmToken,
+                    senderId,
+                    senderName,
+                    messageText,
+                    messageId
+                );
+
+                return {
+                    success: true,
+                    message: 'Message notification sent'
+                };
+
+            } catch (error: any) {
+                request.log.error({ error }, 'Failed to send message notification');
+                reply.code(500);
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
+
 
 
         // Whisper audio transcription endpoint
