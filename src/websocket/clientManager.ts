@@ -9,6 +9,8 @@ export class ClientManager {
     private callSessions: Map<string, CallSession> = new Map();
     // Mobile user registry for FCM tokens
     private mobileUsers: Map<string, { socketId: string; displayName: string; fcmToken?: string; socket: any }> = new Map();
+    // Web user registry
+    private webUsers: Map<string, { socketId: string; displayName: string; socket: any }> = new Map();
     // Persistent user directory - keeps users even when offline
     private userDirectory: Map<string, { displayName: string; fcmToken?: string; isOnline: boolean }> = new Map();
 
@@ -34,8 +36,26 @@ export class ClientManager {
         logger.info({ userId, displayName, hasFcmToken: !!fcmToken }, 'Mobile user registered');
     }
 
+    addWebUser(userId: string, displayName: string, socket: any): void {
+        this.webUsers.set(userId, {
+            socketId: socket.id || userId,
+            displayName,
+            socket
+        });
+        logger.info({
+            userId,
+            displayName,
+            socketId: socket.id,
+            totalWebUsers: this.webUsers.size
+        }, 'Web user registered - Socket stored');
+    }
+
     getMobileUser(userId: string) {
         return this.mobileUsers.get(userId);
+    }
+
+    getWebUser(userId: string) {
+        return this.webUsers.get(userId);
     }
 
     removeMobileUser(userId: string): void {
@@ -46,6 +66,11 @@ export class ClientManager {
             user.isOnline = false;
         }
         logger.info({ userId }, 'Mobile user disconnected');
+    }
+
+    removeWebUser(userId: string): void {
+        this.webUsers.delete(userId);
+        logger.info({ userId }, 'Web user disconnected');
     }
 
     getAllMobileUsers(): Array<{ id: string; name: string }> {

@@ -543,14 +543,75 @@ const startServer = async () => {
                 });
                 logger.info({ callerId, recipientId, callId }, 'Notified caller to initiate P2P connection');
             } else {
+                // DEBUG: Log why we couldn't find the caller
+                const allUsers = clientManager.getAllUsers();
+                logger.error({
+                    callerId,
+                    callerFound: !!caller,
+                    hasSocket: !!caller?.socket,
+                    totalUsers: allUsers.length,
+                    availableUserIds: allUsers.map(u => u.id)
+                }, 'Caller not found or offline - cannot initiate P2P');
+            }
+
+            return {
+                success: true,
+            };
+        });
+
+        // Agent escalation endpoint for WEB client - Rings User B's web client specifically
+        fastify.post('/api/escalate-call-web', async (request, reply) => {
+            const { callId, recipientId, callerId, callerName } = request.body as {
+                callId: string;
+                recipientId: string;
+                callerId: string;
+                callerName: string;
+            };
+
+            logger.info({ callId, recipientId, callerId }, 'Agent server escalating call to WEB user');
+
+            // Import clientManager to get caller socket
+            const { clientManager } = await import('./websocket/clientManager');
+
+            // Step 1: Ring User B (recipientId) - TARGETING WEB CLIENT
+            const { ringWebUser } = await import('./websocket/signalingServer');
+            const ringResult = await ringWebUser(recipientId, callerId, callId, callerName);
+
+            if (!ringResult.success) {
+                logger.warn({ callId, recipientId, reason: ringResult.reason }, 'Failed to ring web user');
+                reply.code(400);
+                return {
+                    success: false,
+                    error: ringResult.reason
+                };
+            }
+
+            // Step 2: Tell User A (callerId) to initiate WebRTC connection to User B
+            const caller = clientManager.getUserFromDirectory(callerId);
+            logger.info({ callerId, callerFound: !!caller, hasSocket: !!caller?.socket }, 'Looking up caller for P2P initiation');
+
+            if (caller && caller.socket) {
+                logger.info({ callerId, recipientId, callId }, 'Triggering initiateWebCall logic for caller');
+
+                // Invoke the exact logic used by 'call-user-web'
+                const { initiateWebCall } = await import('./websocket/signalingServer');
+                await initiateWebCall(caller.socket, {
+                    to: recipientId,
+                    from: callerId,
+                    callId: callId,
+                    callerName: callerName // Pass the agent's name
+                });
+
+                logger.info({ callerId, recipientId, callId }, 'initiateWebCall executed successfully');
+            } else {
                 logger.warn({ callerId, callerExists: !!caller, hasSocket: !!caller?.socket }, 'Caller not found or offline - cannot initiate P2P');
             }
 
             return {
                 success: true,
-                message: 'User B has been notified and P2P connection initiated'
             };
         });
+
 
         // Conversation transcript endpoint - receives transcripts from mobile app
         fastify.post('/api/conversation-transcript', async (request, reply) => {

@@ -88,6 +88,12 @@ class AgentProxyService {
             try {
                 const msg = JSON.parse(data.toString());
 
+                // DEBUG: Log ALL incoming message types from agent
+                if (msg.type !== 'audio') { // efficient logging, skip audio chunks
+                    console.log(`[AgentProxy] Received message type: ${msg.type}`);
+                    console.log(`[AgentProxy] Payload:`, JSON.stringify(msg).substring(0, 200)); // Log first 200chars
+                }
+
                 if (msg.type === 'audio') {
                     clientSocket.emit('agent-audio-response', {
                         callId: callData.callId,

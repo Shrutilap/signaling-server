@@ -9,7 +9,7 @@ import pino from 'pino';
 import { config } from '../config';
 import { sendPushNotification } from '../services/firebaseService';
 import PermissionService from '../services/PermissionService';
-import AgentProxyService from '../services/AgentProxyService';
+
 import UpdatesService from '../services/UpdatesService';
 import ConversationService from '../services/ConversationService';
 
@@ -57,21 +57,80 @@ export async function ringUser(
     return { success: true };
 }
 
+/**
+ * Ring a specific web user
+ */
+export async function ringWebUser(
+    recipientId: string,
+    callerId: string,
+    callId: string,
+    callerName: string
+): Promise<{ success: boolean; reason?: string }> {
+    logger.info({ callerId, recipientId, callId }, 'Attempting to ring WEB user');
+
+    const webRecipient = clientManager.getWebUser(recipientId);
+
+    if (!webRecipient) {
+        logger.warn({ recipientId }, 'Web recipient not found');
+        return { success: false, reason: 'Web user not found or offline' };
+    }
+
+    if (webRecipient.socket) {
+        webRecipient.socket.emit('incoming-call', { from: callerId, callId, callerName });
+        logger.info({ recipientId, status: 'online' }, 'Sent socket notification to WEB client');
+        return { success: true };
+    }
+
+    return { success: false, reason: 'Web socket not available' };
+}
+
+export async function initiateWebCall(
+    socket: any,
+    data: { to: string; from: string; callId: string; callerName: string }
+) {
+    const { to, from, callId, callerName } = data;
+    logger.info({ from, to, callId }, 'Web call initiated via initiateWebCall');
+
+    try {
+        // P2P Routing - Permission Bypass as requested
+        logger.info({ callId }, 'Routing to P2P (calls allowed) - PERMISSION CHECK BYPASSED');
+        const result = await ringUser(to, from, callId, callerName);
+
+        if (!result.success) {
+            socket.emit('call-failed', { reason: result.reason });
+            return { success: false, reason: result.reason };
+        }
+        return { success: true };
+    } catch (error) {
+        logger.error({ error }, 'Error in initiateWebCall');
+        socket.emit('call-failed', { reason: 'Internal server error' });
+        return { success: false, reason: 'Internal server error' };
+    }
+}
+
 export function setupSocketIOServer(io: SocketIOServer): void {
     io.on('connection', (socket: Socket) => {
         let userId: string | null = null;
 
         logger.info('New Socket.IO connection');
 
-        // Mobile App - Register User
-        socket.on('register-user', async (data: { userId: string; displayName: string; fcmToken?: string }) => {
+        // Mobile App / Web Client - Register User
+        socket.on('register-user', async (data: { userId: string; displayName: string; fcmToken?: string; source?: string }) => {
             userId = data.userId;
-            const { displayName, fcmToken } = data;
+            const { displayName, fcmToken, source } = data;
+
+            if (source === 'web') {
+                // Register as web user
+                clientManager.addWebUser(userId, displayName, socket as any);
+                logger.info({ userId, displayName }, 'Web client registered');
+            } else {
+                // Default to mobile user
+                clientManager.addMobileUser(userId, displayName, socket as any, fcmToken);
+                logger.info({ userId, displayName }, 'Mobile user registered');
+            }
 
             // Store socket for this user
-            clientManager.addMobileUser(userId, displayName, socket as any, fcmToken);
-
-            logger.info({ userId, displayName }, 'Mobile user registered');
+            // clientManager.addMobileUser(userId, displayName, socket as any, fcmToken); // REMOVED duplicate call
 
             socket.emit('registered', { userId });
 
@@ -123,7 +182,6 @@ export function setupSocketIOServer(io: SocketIOServer): void {
         });
         */
 
-        // Mobile App - Initiate Call (with permission check)
         socket.on('call-user', async (data: { to: string; from: string; callId: string; callerName: string }) => {
             const { to, from, callId, callerName } = data;
 
@@ -150,9 +208,13 @@ export function setupSocketIOServer(io: SocketIOServer): void {
                     // Base URL from config + query params for context
                     // Construct dynamic agent URL for the client
                     // Base URL from config + query params for context
-                    const baseHandlerUrl = "wss://agentserver-662251767689.asia-south1.run.app/talk_to_emp's_nimi/";
-                    // const baseHandlerUrl = config.agentServerUrl;
-                    const dynamicAgentUrl = `${baseHandlerUrl}?empid=${to}&calleremp=${from}`;
+                    const baseHandlerUrl = config.agentServerUrl;
+
+                    // Construct callback URL for escalation (prefer PUBLIC_URL from env, else fallback to local)
+                    const publicUrl = process.env.PUBLIC_URL || `http://${process.env.HOST || '192.168.1.8'}:${config.port}`;
+                    const callbackUrl = `${publicUrl}/api/escalate-call`;
+
+                    const dynamicAgentUrl = `${baseHandlerUrl}?empid=${to}&calleremp=${from}&callbackUrl=${encodeURIComponent(callbackUrl)}`;
 
                     console.log(`[Signaling] Constructed dynamic agent URL: ${dynamicAgentUrl}`);
 
@@ -164,12 +226,20 @@ export function setupSocketIOServer(io: SocketIOServer): void {
                     });
 
                     // Create proxy to agent server
-                    await AgentProxyService.createProxy(socket, { from, to, callId, callerName });
+                    //removed this socket connection to agent server -28/1
+                    // await AgentProxyService.createProxy(socket, { from, to, callId, callerName });
                 }
             } catch (error) {
                 logger.error({ error }, 'Error in call-user handler');
                 socket.emit('call-failed', { reason: 'Internal server error' });
             }
+        });
+
+
+
+        // Mobile App - Initiate Call (Web / Forced P2P)
+        socket.on('call-user-web', async (data: { to: string; from: string; callId: string; callerName: string }) => {
+            await initiateWebCall(socket, data);
         });
 
         // Mobile App - WebRTC Offer
@@ -237,6 +307,26 @@ export function setupSocketIOServer(io: SocketIOServer): void {
             const recipient = clientManager.getMobileUser(to);
             if (recipient?.socket) {
                 recipient.socket.emit('call-accepted', { from, callId });
+            }
+
+            // Sync: If user answered on one device, stop ringing on their other devices
+            try {
+                const mobileUser = clientManager.getMobileUser(from);
+                const webUser = clientManager.getWebUser(from);
+
+                // If answered on Web (current socket != mobile socket), tell mobile to stop
+                if (mobileUser?.socket && mobileUser.socket.id !== socket.id) {
+                    logger.info({ from, device: 'mobile' }, 'Cancelling call on other device (mobile)');
+                    mobileUser.socket.emit('call-answered-elsewhere', { callId });
+                }
+
+                // If answered on Mobile (current socket != web socket), tell web to stop
+                if (webUser?.socket && webUser.socket.id !== socket.id) {
+                    logger.info({ from, device: 'web' }, 'Cancelling call on other device (web)');
+                    webUser.socket.emit('call-answered-elsewhere', { callId });
+                }
+            } catch (error) {
+                logger.error({ error }, 'Error syncing call status across devices');
             }
         });
 
