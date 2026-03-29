@@ -46,6 +46,8 @@ coverage/
 *.temp
 tmp/
 temp/
+temp_audio/
+test-db.js
 
 # OS files
 Thumbs.db

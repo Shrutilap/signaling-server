@@ -12,6 +12,7 @@ interface Conversation {
     createdAt: Date;
     lastMessageAt: Date;
     messages: Message[];
+    callTranscripts: Message[];
     participants: string[];
 }
 
@@ -82,6 +83,58 @@ class ConversationService {
             );
         } catch (error) {
             console.error('[ConversationService] Error logging message:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Log a transcribed call snippet
+     * Stores in a separate array `callTranscripts`
+     */
+    async logCallTranscript(
+        senderId: string,
+        recipientId: string,
+        text: string,
+        timestamp?: number
+    ): Promise<void> {
+        if (!this.db) {
+            throw new Error('ConversationService not initialized');
+        }
+
+        try {
+            const conversationId = this.getConversationId(senderId, recipientId);
+            const participants = [senderId, recipientId].sort();
+            const now = new Date(timestamp || Date.now());
+
+            const transcriptMessage: Message = {
+                senderId,
+                text,
+                createdAt: now,
+            };
+
+            await this.db.collection('conversations').updateOne(
+                { conversationId },
+                {
+                    $setOnInsert: {
+                        conversationId,
+                        createdAt: now,
+                        participants,
+                    },
+                    $set: {
+                        lastMessageAt: now,
+                    },
+                    $push: {
+                        callTranscripts: transcriptMessage,
+                    } as any,
+                },
+                { upsert: true }
+            );
+
+            console.log(
+                `[ConversationService] Call transcript logged: ${conversationId} | ${senderId} → ${recipientId}`
+            );
+        } catch (error) {
+            console.error('[ConversationService] Error logging call transcript:', error);
             throw error;
         }
     }

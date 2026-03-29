@@ -12,6 +12,7 @@ import PermissionService from '../services/PermissionService';
 
 import UpdatesService from '../services/UpdatesService';
 import ConversationService from '../services/ConversationService';
+import WhisperTranscriptionService from '../services/WhisperTranscriptionService';
 
 const logger = pino({ level: config.logLevel });
 
@@ -377,6 +378,11 @@ export function setupSocketIOServer(io: SocketIOServer): void {
             if (recipient?.socket) {
                 recipient.socket.emit('call-ended', { from, callId });
             }
+
+            // Flush and stop whisper transcription for this call
+            WhisperTranscriptionService.stopCall(callId).catch(err => {
+                logger.error({ error: err, callId }, 'Failed to stop whisper for call');
+            });
         });
 
         // Mobile App - Send Message
@@ -452,6 +458,14 @@ export function setupSocketIOServer(io: SocketIOServer): void {
             } catch (error) {
                 logger.error({ error, messageId }, 'Failed to log message to database');
             }
+        });
+
+        // P2P Audio — stream audio chunks to Whisper for transcription
+        socket.on('p2p-audio', (data: { callId: string; otherUserId: string; audioData: string }) => {
+            if (!userId) return;
+            WhisperTranscriptionService.addAudioChunk(
+                data.callId, userId, data.otherUserId, data.audioData
+            );
         });
 
         // Disconnect

@@ -6,7 +6,7 @@ import { config } from './config';
 import pino from 'pino';
 import FastifyMultipart from '@fastify/multipart';
 import PermissionService from './services/PermissionService';
-import UserService from './services/UserService';
+import UserService, { DatabaseUser } from './services/UserService';
 import AgentProxyService from './services/AgentProxyService';
 import ConversationService from './services/ConversationService';
 import UpdatesService from './services/UpdatesService';
@@ -191,6 +191,8 @@ const startServer = async () => {
             });
         });
 
+
+
         // Health check
         fastify.get('/api/health', async () => {
             return {
@@ -354,6 +356,27 @@ const startServer = async () => {
                 return {
                     success: true,
                     message: 'Permissions updated successfully'
+                };
+            } catch (error: any) {
+                reply.code(500);
+                return {
+                    success: false,
+                    error: error.message
+                };
+            }
+        });
+
+        // Update user profile details
+        fastify.put('/api/users/:userId', async (request, reply) => {
+            try {
+                const { userId } = request.params as { userId: string };
+                const userData = request.body as Partial<DatabaseUser>;
+
+                await UserService.updateUser(userId, userData);
+
+                return {
+                    success: true,
+                    message: 'User updated successfully'
                 };
             } catch (error: any) {
                 reply.code(500);
@@ -615,10 +638,11 @@ const startServer = async () => {
 
         // Conversation transcript endpoint - receives transcripts from mobile app
         fastify.post('/api/conversation-transcript', async (request, reply) => {
-            const { callId, userId, userName, transcript, timestamp, isFinal } = request.body as {
+            const { callId, userId, userName, otherUserId, transcript, timestamp, isFinal } = request.body as {
                 callId: string;
                 userId: string;
                 userName: string;
+                otherUserId: string;
                 transcript: string;
                 timestamp: number;
                 isFinal: boolean;
@@ -628,6 +652,7 @@ const startServer = async () => {
                 callId,
                 userId,
                 userName,
+                otherUserId,
                 transcriptLength: transcript.length,
                 isFinal,
                 timestamp
@@ -637,14 +662,25 @@ const startServer = async () => {
             console.log('='.repeat(60));
             console.log(`[TRANSCRIPT] ${userName} (${userId})`);
             console.log(`[CALL ID] ${callId}`);
+            console.log(`[OTHER USER] ${otherUserId}`);
             console.log(`[STATUS] ${isFinal ? 'FINAL' : 'PARTIAL'}`);
             console.log(`[TEXT] ${transcript}`);
             console.log('='.repeat(60));
 
-            // TODO: Forward to AI server when endpoint is available
-            // await aiServerClient.sendConversationTranscript({
-            //     callId, userId, userName, transcript, timestamp, isFinal
-            // });
+            // Persist final transcripts to conversation history
+            if (isFinal && transcript.trim()) {
+                try {
+                    await ConversationService.logMessage(
+                        userId,
+                        otherUserId,
+                        `[call:${callId}] ${transcript}`,
+                        timestamp
+                    );
+                    logger.info({ callId, userId, otherUserId }, 'Transcript persisted to conversation');
+                } catch (error) {
+                    logger.error({ error }, 'Failed to persist transcript');
+                }
+            }
 
             return {
                 success: true,
@@ -795,6 +831,60 @@ const startServer = async () => {
         // })
 
         await fastify.listen({ port: config.port, host: '0.0.0.0' });
+
+        
+        const { WebSocketServer } = require('ws');
+        const sttWss = new WebSocketServer({ noServer: true });
+        
+        sttWss.on('connection', (socket: any) => {
+            const GoogleSTTService = require('./services/GoogleSTTService').default;
+            let sttStream: any = null;
+
+            socket.on('message', (message: any) => {
+                try {
+                    const msg = JSON.parse(message.toString());
+                    
+                    if (msg.type === 'start') {
+                        console.log('[STT Proxy Native] Starting new stream session');
+                        if (sttStream) sttStream.close();
+                        sttStream = GoogleSTTService.createStream(
+                            (transcript: string, isFinal: boolean) => {
+                                socket.send(JSON.stringify({ type: 'transcript', isFinal, text: transcript }));
+                            },
+                            (error: Error) => {
+                                socket.send(JSON.stringify({ type: 'error', message: error.message }));
+                            }
+                        );
+                    } else if (msg.type === 'audio' && sttStream) {
+                        sttStream.writeBlock(msg.data);
+                    } else if (msg.type === 'stop' && sttStream) {
+                        console.log('[STT Proxy Native] Stopping stream session manually');
+                        sttStream.close();
+                        sttStream = null;
+                    }
+                } catch (e) {
+                    console.error('[STT Proxy Native] Error processing message', e);
+                }
+            });
+
+            socket.on('close', () => {
+                if (sttStream) {
+                    console.log('[STT Proxy Native] Connection closed, cleaning up stream');
+                    sttStream.close();
+                }
+            });
+        });
+
+        // Intercept upgrade requests manually
+        fastify.server.on('upgrade', (request, socket, head) => {
+            if (request.url === '/api/stt-stream') {
+                sttWss.handleUpgrade(request, socket, head, (ws: any) => {
+                    sttWss.emit('connection', ws, request);
+                });
+            }
+            // All other upgrade requests (like /socket.io/) will be naturally ignored here
+            // and handled by Socket.IO below.
+        });
 
         // Setup Socket.IO server
         const io = new SocketIOServer(fastify.server, {

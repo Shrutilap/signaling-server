@@ -115,6 +115,29 @@ class UserService {
     }
 
     /**
+     * Update user details in the database
+     */
+    async updateUser(empid: string, userData: Partial<DatabaseUser>): Promise<void> {
+        if (!this.db) {
+            throw new Error('UserService not initialized');
+        }
+
+        const { _id, ...updateData } = userData; // Remove _id if present
+
+        await this.db.collection('users').updateOne(
+            { empid },
+            {
+                $set: {
+                    ...updateData,
+                    updatedAt: new Date()
+                }
+            }
+        );
+
+        console.log(`[UserService] Updated profile for ${empid}`);
+    }
+
+    /**
      * Update user availability status
      */
     async updateAvailability(empid: string, availability: string): Promise<void> {

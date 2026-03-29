@@ -114,6 +114,11 @@ class AgentProxyService {
                         callId: callData.callId,
                         message: msg.data,
                     });
+                } else if (msg.type === 'interrupt' || msg.type === 'interrupted') {
+                    console.log(`[AgentProxy] Relaying agent interrupt to mobile`);
+                    clientSocket.emit('agent-interrupted', {
+                        callId: callData.callId,
+                    });
                 }
             } catch (e) {
                 console.error('[AgentProxy] Parse error:', e);
