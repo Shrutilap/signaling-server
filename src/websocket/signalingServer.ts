@@ -112,8 +112,15 @@ export async function initiateWebCall(
 export function setupSocketIOServer(io: SocketIOServer): void {
     io.on('connection', (socket: Socket) => {
         let userId: string | null = null;
+        let activeCallId: string | null = null;
 
         logger.info('New Socket.IO connection');
+        console.log(`[SOCKET-DEBUG] New connection: ${socket.id}`);
+
+        // Loud debugging for ANY incoming event
+        socket.onAny((event, ...args) => {
+            console.log(`[SOCKET-DEBUG] [${socket.id}] RAW-EVENT: ${event} | Payload:`, JSON.stringify(args, null, 2));
+        });
 
         // Mobile App / Web Client - Register User
         socket.on('register-user', async (data: { userId: string; displayName: string; fcmToken?: string; source?: string }) => {
@@ -129,6 +136,8 @@ export function setupSocketIOServer(io: SocketIOServer): void {
                 clientManager.addMobileUser(userId, displayName, socket as any, fcmToken);
                 logger.info({ userId, displayName }, 'Mobile user registered');
             }
+
+            console.log(`[SOCKET-DEBUG] [${socket.id}] Registered user: ${userId} (${displayName}) as ${source || 'mobile'}`);
 
             // Store socket for this user
             // clientManager.addMobileUser(userId, displayName, socket as any, fcmToken); // REMOVED duplicate call
@@ -310,6 +319,9 @@ export function setupSocketIOServer(io: SocketIOServer): void {
                 recipient.socket.emit('call-accepted', { from, callId });
             }
 
+            // Track active call for cleanup
+            activeCallId = callId;
+
             // Sync: If user answered on one device, stop ringing on their other devices
             try {
                 const mobileUser = clientManager.getMobileUser(from);
@@ -372,17 +384,61 @@ export function setupSocketIOServer(io: SocketIOServer): void {
         socket.on('end-call', async (data: { to: string; from: string; callId: string }) => {
             const { to, from, callId } = data;
 
-            logger.info({ from, to, callId }, 'Mobile call ended');
+            console.log(`[SOCKET-DEBUG] [${socket.id}] RECEIVED end-call EVENT for callId: ${callId}`);
+            logger.info({ from, to, callId }, '[DEBUG-CALL-END] Mobile call end event received');
 
             const recipient = clientManager.getMobileUser(to);
             if (recipient?.socket) {
                 recipient.socket.emit('call-ended', { from, callId });
+                logger.info({ to, callId }, '[DEBUG-CALL-END] Forwarded call-ended to recipient');
             }
 
-            // Flush and stop whisper transcription for this call
-            WhisperTranscriptionService.stopCall(callId).catch(err => {
-                logger.error({ error: err, callId }, 'Failed to stop whisper for call');
-            });
+            activeCallId = null; // Clear active call on explicit end
+
+            // Flush, stop whisper transcription, and get final chronological conversation
+            logger.info({ callId }, '[DEBUG-CALL-END] Calling WhisperTranscriptionService.stopCall');
+            WhisperTranscriptionService.stopCall(callId)
+                .then(async (conversation) => {
+                    logger.info({ callId, count: conversation ? conversation.length : 'null' }, '[DEBUG-CALL-END] stopCall promise resolved');
+                    
+                    if (conversation && conversation.length > 0) {
+                        const transcriptPayload = {
+                            empid1: from,
+                            empid2: to,
+                            conversation: conversation
+                        };
+
+                        // Print the exact payload to console as requested
+                        console.log("\n================ [PROCESS-CONVERSATION PAYLOAD] ================");
+                        console.log(JSON.stringify(transcriptPayload, null, 2));
+                        console.log("=================================================================\n");
+
+                        const sumRoute = `${config.aiServerUrl}/process-conversation`;
+                        logger.info({ sumRoute, transcriptCount: conversation.length }, 'Sending conversation array to summarization route');
+                        
+                        try {
+                            const response = await fetch(sumRoute, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(transcriptPayload)
+                            });
+
+                            if (!response.ok) {
+                                logger.error({ status: response.status, statusText: response.statusText, sumRoute }, 'Summarization route returned error');
+                            } else {
+                                const result = await response.json();
+                                logger.info({ result }, 'Summarization route returned success');
+                            }
+                        } catch (fetchErr: any) {
+                            logger.error({ error: fetchErr.message, sumRoute }, 'Failed to fetch summarization route');
+                        }
+                    } else {
+                        logger.warn({ callId }, '[DEBUG-CALL-END] Conversation was empty, skipping summarization');
+                    }
+                })
+                .catch(err => {
+                    logger.error({ error: err.message, callId }, 'Failed to stop whisper or send summarization');
+                });
         });
 
         // Mobile App - Send Message
@@ -463,6 +519,12 @@ export function setupSocketIOServer(io: SocketIOServer): void {
         // P2P Audio — stream audio chunks to Whisper for transcription
         socket.on('p2p-audio', (data: { callId: string; otherUserId: string; audioData: string }) => {
             if (!userId) return;
+
+            // Sample audio logging to see if data is flowing
+            if (Math.random() < 0.005) { // Log highly sampled
+                console.log(`[SOCKET-DEBUG] [${socket.id}] Received p2p-audio (sampled) for call: ${data.callId}`);
+            }
+
             WhisperTranscriptionService.addAudioChunk(
                 data.callId, userId, data.otherUserId, data.audioData
             );
@@ -471,8 +533,17 @@ export function setupSocketIOServer(io: SocketIOServer): void {
         // Disconnect
         socket.on('disconnect', () => {
             if (userId) {
+                console.log(`[SOCKET-DEBUG] [${socket.id}] Disconnected user: ${userId}`);
                 clientManager.removeMobileUser(userId);
                 logger.info({ userId }, 'Socket.IO connection closed');
+
+                // If a call was active, ensure it's stopped and cleaned up
+                if (activeCallId) {
+                    logger.info({ userId, activeCallId }, 'Device disconnected during active call, calling stopCall');
+                    WhisperTranscriptionService.stopCall(activeCallId).catch(err => {
+                        logger.error({ error: err.message, activeCallId }, 'Cleanup stopCall failed on disconnect');
+                    });
+                }
 
                 // Broadcast to all users that this user went offline
                 socket.broadcast.emit('user-disconnected', { userId });

@@ -23,7 +23,7 @@ FROM node:20-alpine
 WORKDIR /app
 
 ENV NODE_ENV=production
-ENV PORT=8080
+ENV PORT=3000   
 
 # Copy ONLY production node_modules from builder
 COPY --from=builder /app/node_modules ./node_modules
@@ -32,6 +32,6 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/public ./public
 
-EXPOSE 8080
+EXPOSE 3000
 
 CMD ["node", "dist/server.js"]

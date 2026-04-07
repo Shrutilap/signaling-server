@@ -830,7 +830,7 @@ const startServer = async () => {
         //     }
         // })
 
-        await fastify.listen({ port: config.port, host: '0.0.0.0' });
+        // Server listening moved to the end of startServer() to avoid FST_ERR_REOPENED_SERVER
 
         
         const { WebSocketServer } = require('ws');
@@ -845,7 +845,8 @@ const startServer = async () => {
                     const msg = JSON.parse(message.toString());
                     
                     if (msg.type === 'start') {
-                        console.log('[STT Proxy Native] Starting new stream session');
+                        const { userId, otherUserId } = msg;
+                        console.log(`[STT Proxy Native] Starting new stream session for ${userId} -> ${otherUserId}`);
                         if (sttStream) sttStream.close();
                         sttStream = GoogleSTTService.createStream(
                             (transcript: string, isFinal: boolean) => {
@@ -853,7 +854,9 @@ const startServer = async () => {
                             },
                             (error: Error) => {
                                 socket.send(JSON.stringify({ type: 'error', message: error.message }));
-                            }
+                            },
+                            userId,
+                            otherUserId
                         );
                     } else if (msg.type === 'audio' && sttStream) {
                         sttStream.writeBlock(msg.data);
@@ -897,6 +900,9 @@ const startServer = async () => {
 
         setupSocketIOServer(io);
 
+        // IMPORTANT: Start listening AFTER attaching WebSockets and Socket.io
+        await fastify.listen({ port: config.port, host: '0.0.0.0' });
+
         logger.info(`Call Gateway running on port ${config.port}`);
         logger.info(`Socket.IO endpoint: http://localhost:${config.port}`);
         logger.info(`Web client: http://localhost:${config.port}`);
@@ -906,7 +912,14 @@ const startServer = async () => {
     }
 };
 
-const server = startServer();
+// Guard execution to ensure it only runs once and is not imported multiple times
+let isStarted = false;
+if (require.main === module) {
+    if (!isStarted) {
+        isStarted = true;
+        startServer();
+    }
+}
 
 // Graceful Shutdown for Cloud Run
 const signalHandler = async (signal: string) => {

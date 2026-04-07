@@ -1,262 +1,154 @@
-import { execSync } from 'child_process';
-import * as fs from 'fs';
-import * as path from 'path';
 import pino from 'pino';
 import { config } from '../config';
-import ConversationService from './ConversationService';
+import GoogleSTTService from './GoogleSTTService';
 
 const logger = pino({ level: config.logLevel });
 
-interface AudioBuffer {
+interface AudioStreamSession {
     userId: string;
     otherUserId: string;
-    chunks: Buffer[];
-    timer: NodeJS.Timeout | null;
-    totalBytes: number;
-    lastFlushTime: number;
+    stream: any | null; // The GoogleSTTStream object (null if errored or not yet created)
+    lastActivity: number;
+    transcripts: { empid: string; message: string; timestamp: number }[];
 }
 
-class WhisperTranscriptionService {
-    private audioBuffers: Map<string, AudioBuffer> = new Map();
-    private tempDir: string;
-    private whisperBinaryPath: string;
-    private modelPath: string;
-    private flushIntervalMs: number = 7000; // Transcribe every 7 seconds
-    private minAudioBytes: number = 32000; // Minimum ~1 second of audio at 16kHz mono 16-bit
+/**
+ * STTService (formerly WhisperTranscriptionService)
+ * 
+ * Channels audio chunks directly to Google Cloud STT streaming for real-time, 
+ * VAD-based transcription.
+ */
+class STTService {
+    private sessions: Map<string, AudioStreamSession> = new Map();
 
     constructor() {
-        // Setup paths
-        this.tempDir = path.join(process.cwd(), 'temp_audio');
-
-        // nodejs-whisper paths
-        const whisperBase = path.join(process.cwd(), 'node_modules', 'nodejs-whisper', 'cpp', 'whisper.cpp');
-        this.whisperBinaryPath = path.join(whisperBase, 'build', 'bin', 'Release', 'whisper-cli.exe');
-        this.modelPath = path.join(whisperBase, 'models', 'ggml-base.bin');
-
-        // Create temp directory
-        if (!fs.existsSync(this.tempDir)) {
-            fs.mkdirSync(this.tempDir, { recursive: true });
-        }
-
-        // Verify whisper binary and model exist
-        if (!fs.existsSync(this.whisperBinaryPath)) {
-            logger.error({ path: this.whisperBinaryPath }, '[Whisper] Binary not found!');
-        } else if (!fs.existsSync(this.modelPath)) {
-            logger.error({ path: this.modelPath }, '[Whisper] Model not found!');
-        } else {
-            logger.info('[Whisper] Service initialized — binary and model found');
-        }
+        logger.info('[STTService] Initialized — Using Real-time Streaming (VAD) backend');
     }
 
     /**
-     * Add an audio chunk to the buffer for a specific call/user
+     * Add an audio chunk to the active stream for a specific call/user
      */
     addAudioChunk(callId: string, userId: string, otherUserId: string, audioDataBase64: string): void {
-        const bufferKey = `${callId}_${userId}`;
+        const sessionKey = `${callId}_${userId}`;
 
-        if (!this.audioBuffers.has(bufferKey)) {
-            // Create new buffer for this call/user
-            const buffer: AudioBuffer = {
+        if (!this.sessions.has(sessionKey)) {
+            logger.info({ callId, userId, sessionKey }, '[STTService] Creating NEW session');
+            this.sessions.set(sessionKey, {
                 userId,
                 otherUserId,
-                chunks: [],
-                timer: null,
-                totalBytes: 0,
-                lastFlushTime: Date.now(),
-            };
-
-            // Start periodic flush timer
-            buffer.timer = setInterval(() => {
-                this.flushAndTranscribe(bufferKey, callId);
-            }, this.flushIntervalMs);
-
-            this.audioBuffers.set(bufferKey, buffer);
-            logger.info({ callId, userId, bufferKey }, '[Whisper] New audio buffer created');
-        }
-
-        const buffer = this.audioBuffers.get(bufferKey)!;
-
-        // Decode base64 to raw PCM buffer
-        const pcmData = Buffer.from(audioDataBase64, 'base64');
-        buffer.chunks.push(pcmData);
-        buffer.totalBytes += pcmData.length;
-    }
-
-    /**
-     * Flush buffered audio, write WAV, transcribe with Whisper, store result
-     */
-    private async flushAndTranscribe(bufferKey: string, callId: string): Promise<void> {
-        const buffer = this.audioBuffers.get(bufferKey);
-        if (!buffer || buffer.chunks.length === 0) return;
-
-        // Check minimum audio length
-        if (buffer.totalBytes < this.minAudioBytes) {
-            return; // Not enough audio yet
-        }
-
-        // Take all chunks and reset buffer
-        const chunks = buffer.chunks.splice(0);
-        const totalBytes = buffer.totalBytes;
-        buffer.totalBytes = 0;
-        buffer.lastFlushTime = Date.now();
-
-        // Combine all PCM chunks
-        const pcmData = Buffer.concat(chunks);
-
-        // Write WAV file
-        const wavPath = path.join(this.tempDir, `${bufferKey}_${Date.now()}.wav`);
-
-        try {
-            this.writePcmToWav(pcmData, wavPath);
-
-            logger.info({
-                bufferKey,
-                callId,
-                pcmBytes: pcmData.length,
-                durationSecs: (pcmData.length / (16000 * 2)).toFixed(1),
-            }, '[Whisper] Transcribing audio chunk');
-
-            // Run whisper transcription
-            const transcript = this.runWhisper(wavPath);
-
-            if (transcript && transcript.trim()) {
-                logger.info({
-                    callId,
-                    userId: buffer.userId,
-                    transcript: transcript.substring(0, 100),
-                }, '[Whisper] Transcription result');
-
-                // Store in MongoDB
-                try {
-                    await ConversationService.logCallTranscript(
-                        buffer.userId,
-                        buffer.otherUserId,
-                        `[call:${callId}] ${transcript.trim()}`,
-                        Date.now()
-                    );
-                    logger.info({ callId, userId: buffer.userId }, '[Whisper] Transcript persisted');
-                } catch (dbError) {
-                    logger.error({ error: dbError }, '[Whisper] Failed to persist transcript');
-                }
-            } else {
-                logger.debug({ bufferKey }, '[Whisper] No speech detected in chunk');
-            }
-        } catch (error) {
-            logger.error({ error, bufferKey }, '[Whisper] Transcription failed');
-        } finally {
-            // Cleanup temp WAV file
-            try {
-                if (fs.existsSync(wavPath)) {
-                    fs.unlinkSync(wavPath);
-                }
-            } catch (cleanupErr) {
-                logger.warn({ wavPath }, '[Whisper] Failed to cleanup temp file');
-            }
-        }
-    }
-
-    /**
-     * Run whisper-cli.exe on a WAV file and return the transcript text
-     */
-    private runWhisper(wavPath: string): string {
-        try {
-            const cmd = `"${this.whisperBinaryPath}" -m "${this.modelPath}" -f "${wavPath}" --no-timestamps -l en --output-txt`;
-
-            const output = execSync(cmd, {
-                timeout: 30000, // 30 second timeout
-                encoding: 'utf-8',
-                stdio: ['pipe', 'pipe', 'pipe'],
+                stream: null, // Will be initialized below
+                lastActivity: Date.now(),
+                transcripts: []
             });
+        }
 
-            // whisper-cli outputs the transcript to stdout
-            // Clean up: remove [BLANK_AUDIO] markers and extra whitespace
-            const cleaned = output
-                .replace(/\[BLANK_AUDIO\]/g, '')
-                .replace(/\n+/g, ' ')
-                .trim();
+        const session = this.sessions.get(sessionKey)!;
+        session.lastActivity = Date.now();
 
-            return cleaned;
-        } catch (error: any) {
-            // Check if there's a .txt output file (whisper sometimes writes to file)
-            const txtPath = wavPath.replace('.wav', '.txt');
-            if (fs.existsSync(txtPath)) {
-                const text = fs.readFileSync(txtPath, 'utf-8').trim();
-                try { fs.unlinkSync(txtPath); } catch { }
-                return text;
-            }
+        // If stream doesn't exist or was closed/errored, create a new one for THIS session
+        if (!session.stream) {
+            logger.info({ sessionKey }, '[STTService] Initializing new Google STT stream for existing session');
+            session.stream = GoogleSTTService.createStream(
+                (transcript, isFinal) => {
+                    if (isFinal) {
+                        logger.info({ sessionKey, text: transcript }, '[STTService] Utterance finalized');
+                        session.transcripts.push({
+                            empid: userId,
+                            message: transcript.trim(),
+                            timestamp: Date.now()
+                        });
+                    }
+                },
+                (error) => {
+                    logger.error({ sessionKey, error: error.message }, '[STTService] Stream error — will recreate on next chunk');
+                    this.terminateSessionStream(sessionKey); // Only terminate the stream, not the session
+                },
+                userId,
+                otherUserId
+            );
+        }
 
-            logger.error({ error: error.message }, '[Whisper] CLI execution failed');
-            return '';
+        // Debug: Log info about incoming chunk every ~50 chunks to avoid flooding
+        if (Math.random() < 0.02) {
+            const dataType = typeof audioDataBase64;
+            const dataLength = dataType === 'string' ? audioDataBase64.length : (audioDataBase64 as any).length;
+            logger.info({ sessionKey, dataType, dataLength }, '[STTService] Incoming audio chunk info');
+        }
+
+        // Pipe audio data directly to the stream
+        try {
+            session.stream.writeBlock(audioDataBase64);
+        } catch (e: any) {
+            logger.error({ error: e.message, sessionKey }, '[STTService] Failed to write audio to stream');
         }
     }
 
     /**
-     * Write raw PCM data as a WAV file (16kHz, mono, 16-bit LE)
+     * Terminate ONLY the stream for a specific session (keep transcripts)
      */
-    private writePcmToWav(pcmData: Buffer, outputPath: string): void {
-        const sampleRate = 16000;
-        const numChannels = 1;
-        const bitsPerSample = 16;
-        const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
-        const blockAlign = numChannels * (bitsPerSample / 8);
-        const dataSize = pcmData.length;
-        const headerSize = 44;
-
-        const header = Buffer.alloc(headerSize);
-
-        // RIFF header
-        header.write('RIFF', 0);
-        header.writeUInt32LE(dataSize + headerSize - 8, 4);
-        header.write('WAVE', 8);
-
-        // fmt sub-chunk
-        header.write('fmt ', 12);
-        header.writeUInt32LE(16, 16);           // Sub-chunk size
-        header.writeUInt16LE(1, 20);            // Audio format (PCM)
-        header.writeUInt16LE(numChannels, 22);  // Channels
-        header.writeUInt32LE(sampleRate, 24);   // Sample rate
-        header.writeUInt32LE(byteRate, 28);     // Byte rate
-        header.writeUInt16LE(blockAlign, 32);   // Block align
-        header.writeUInt16LE(bitsPerSample, 34); // Bits per sample
-
-        // data sub-chunk
-        header.write('data', 36);
-        header.writeUInt32LE(dataSize, 40);
-
-        // Write WAV file
-        const fd = fs.openSync(outputPath, 'w');
-        fs.writeSync(fd, header);
-        fs.writeSync(fd, pcmData);
-        fs.closeSync(fd);
+    private terminateSessionStream(sessionKey: string): void {
+        const session = this.sessions.get(sessionKey);
+        if (session && session.stream) {
+            try {
+                session.stream.close();
+            } catch (e) {
+                // Ignore close errors
+            }
+            session.stream = null; // Mark stream as dead
+            logger.info({ sessionKey }, '[STTService] Stream closed (session preserved)');
+        }
     }
 
     /**
-     * Stop buffering for a call — flush remaining audio and cleanup
+     * Stop buffering for a call — close all active streams and return full transcript history
      */
-    async stopCall(callId: string): Promise<void> {
+    async stopCall(callId: string): Promise<{ empid: string; message: string }[]> {
+        logger.info({ callId }, '[STTService] stopCall called — searching for active sessions');
         const keysToRemove: string[] = [];
 
-        for (const [key, buffer] of this.audioBuffers) {
+        // Terminate streams but keep session in memory for final chunks
+        for (const [key, session] of this.sessions) {
             if (key.startsWith(callId)) {
-                // Clear timer
-                if (buffer.timer) {
-                    clearInterval(buffer.timer);
-                    buffer.timer = null;
-                }
-
-                // Final flush
-                await this.flushAndTranscribe(key, callId);
-
                 keysToRemove.push(key);
+                try {
+                    logger.info({ sessionKey: key }, '[STTService] Closing stream for callId');
+                    if (session.stream) {
+                        session.stream.close();
+                        session.stream = null;
+                    }
+                } catch (e) {
+                    // Ignore close errors
+                }
             }
         }
 
-        // Remove buffers
-        for (const key of keysToRemove) {
-            this.audioBuffers.delete(key);
-            logger.info({ bufferKey: key }, '[Whisper] Buffer removed');
+        if (keysToRemove.length === 0) {
+            logger.warn({ callId }, '[STTService] No active sessions found for this callId');
         }
+
+        // Give Google STT a moment to flush final results to the callback
+        logger.info({ callId, sessionCount: keysToRemove.length }, '[STTService] Waiting for stream flush (2.5s)');
+        await new Promise(resolve => setTimeout(resolve, 2500));
+
+        let allTranscripts: { empid: string; message: string; timestamp: number }[] = [];
+
+        // Collect and remove sessions
+        for (const key of keysToRemove) {
+            const session = this.sessions.get(key);
+            if (session) {
+                logger.info({ sessionKey: key, count: session.transcripts ? session.transcripts.length : 0 }, '[STTService] Collecting final transcripts from session');
+                allTranscripts = allTranscripts.concat(session.transcripts);
+                this.sessions.delete(key);
+                logger.info({ sessionKey: key }, '[STTService] Session cleaned up');
+            }
+        }
+
+        // Sort combined transcripts chronologically
+        allTranscripts.sort((a, b) => a.timestamp - b.timestamp);
+        logger.info({ callId, totalTranscripts: allTranscripts.length }, '[STTService] stopCall returning combined transcripts');
+
+        return allTranscripts.map(({ empid, message }) => ({ empid, message }));
     }
 }
 
-export default new WhisperTranscriptionService();
+export default new STTService();
