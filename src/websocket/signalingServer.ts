@@ -1,7 +1,7 @@
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import { v4 as uuidv4 } from 'uuid';
 import { clientManager } from './clientManager';
-import { callRouter } from '../routing/callRouter';
+import { callRoutingService } from '../routing/CallRoutingService';
 import { urgencyDetector } from '../routing/urgencyDetector';
 import { transcriptLogger } from '../transcription/transcriptLogger';
 import { CallSession, WebSocketMessage } from '../models/types';
@@ -35,10 +35,22 @@ export async function ringUser(
         return { success: false, reason: 'User not found' };
     }
 
-    // Send socket event if user is online
-    if (recipient.socket) {
-        recipient.socket.emit('incoming-call', { from: callerId, callId, callerName });
-        logger.info({ recipientId, status: 'online' }, 'Sent socket notification');
+    // Send socket event if user is online, otherwise it will be buffered by sendToClient
+    const message: WebSocketMessage = {
+        type: 'incoming-call',
+        payload: { from: callerId, callId, callerName }
+    };
+
+    let socketMessageSent = false;
+    // clientManager.sendToClient will handle if the user is truly connected or needs buffering
+    socketMessageSent = clientManager.sendToClient(recipientId, message);
+
+    if (socketMessageSent) {
+        logger.info({ recipientId, status: recipient.isOnline ? 'online' : 'buffered' }, 'Sent socket notification (or buffered)');
+    } else {
+        // This case should ideally not happen if user exists in directory and sendToClient handles buffering.
+        // It would mean user not found at all, which is already handled by !recipient check.
+        logger.warn({ recipientId }, 'Failed to send socket notification or buffer message (user not in directory).');
     }
 
     // Always send FCM push notification (works for both online and offline)
@@ -49,9 +61,9 @@ export async function ringUser(
         } catch (error) {
             logger.error({ error }, 'Failed to send FCM notification');
         }
-    } else if (!recipient.socket) {
-        // User is offline and has no FCM token - can't reach them
-        logger.warn({ recipientId }, 'User is offline and has no FCM token');
+    } else if (!socketMessageSent) {
+        // User is offline and has no FCM token and no socket message could be sent/buffered
+        logger.warn({ recipientId }, 'User is offline and unreachable (no FCM, no active socket, no buffer possible)');
         return { success: false, reason: 'User is offline and unreachable' };
     }
 
@@ -76,17 +88,26 @@ export async function ringWebUser(
         return { success: false, reason: 'Web user not found or offline' };
     }
 
-    if (webRecipient.socket) {
-        webRecipient.socket.emit('incoming-call', { from: callerId, callId, callerName });
-        logger.info({ recipientId, status: 'online' }, 'Sent socket notification to WEB client');
-        return { success: true };
-    }
+    const message: WebSocketMessage = {
+        type: 'incoming-call',
+        payload: { from: callerId, callId, callerName }
+    };
 
-    return { success: false, reason: 'Web socket not available' };
+    // Use sendToClient, which will buffer if the web user is temporarily disconnected but known.
+    const sentOrBuffered = clientManager.sendToClient(recipientId, message);
+
+    if (sentOrBuffered) {
+        logger.info({ recipientId, status: webRecipient.socket ? 'online' : 'buffered' }, 'Sent socket notification to WEB client (or buffered)');
+        return { success: true };
+    } else {
+        // This path should ideally be unreachable if webRecipient check passes, as sendToClient buffers for known users.
+        logger.warn({ recipientId }, 'Web socket not available or message not buffered (user not in directory).');
+        return { success: false, reason: 'Web socket not available or message not buffered' };
+    }
 }
 
 export async function initiateWebCall(
-    socket: any,
+    socket: any, // The caller's socket (used for `from` for sending back failures)
     data: { to: string; from: string; callId: string; callerName: string }
 ) {
     const { to, from, callId, callerName } = data;
@@ -98,26 +119,34 @@ export async function initiateWebCall(
         const result = await ringUser(to, from, callId, callerName);
 
         if (!result.success) {
-            socket.emit('call-failed', { reason: result.reason });
+            // Send call-failed back to the initiating client (from)
+            clientManager.sendToClient(from, {
+                type: 'call-failed',
+                payload: { reason: result.reason }
+            });
             return { success: false, reason: result.reason };
         }
         return { success: true };
     } catch (error) {
         logger.error({ error }, 'Error in initiateWebCall');
-        socket.emit('call-failed', { reason: 'Internal server error' });
+        // Send call-failed to the initiating client (from)
+        clientManager.sendToClient(from, {
+            type: 'call-failed',
+            payload: { reason: 'Internal server error' }
+        });
         return { success: false, reason: 'Internal server error' };
     }
 }
 
 export function setupSocketIOServer(io: SocketIOServer): void {
     io.on('connection', (socket: Socket) => {
-        let userId: string | null = null;
+        let userId: string | null = null; // Stored for disconnect handling
 
         logger.info('New Socket.IO connection');
 
         // Mobile App / Web Client - Register User
         socket.on('register-user', async (data: { userId: string; displayName: string; fcmToken?: string; source?: string }) => {
-            userId = data.userId;
+            userId = data.userId; // Set userId for this socket's session
             const { displayName, fcmToken, source } = data;
 
             if (source === 'web') {
@@ -130,19 +159,33 @@ export function setupSocketIOServer(io: SocketIOServer): void {
                 logger.info({ userId, displayName }, 'Mobile user registered');
             }
 
-            // Store socket for this user
-            // clientManager.addMobileUser(userId, displayName, socket as any, fcmToken); // REMOVED duplicate call
-
-            socket.emit('registered', { userId });
+            // Confirm registration back to the client using the new sendToClient method
+            if (userId) {
+                clientManager.sendToClient(userId, { type: 'registered', payload: { userId } });
+            }
 
             // Broadcast to all other users that a new user came online
+            // This is a broadcast mechanism, not a direct message to a specific (potentially disconnected) client,
+            // so it remains as a direct socket.io broadcast.
             socket.broadcast.emit('user-connected', { id: userId, name: displayName });
+        });
+
+        // Handle disconnect: Remove client and mark offline, which also starts buffering timer
+        socket.on('disconnect', () => {
+            if (userId) {
+                logger.info({ userId }, 'Client disconnected via socket.on(disconnect)');
+                clientManager.removeClient(userId); // This now marks offline and prepares for buffering
+            } else {
+                logger.warn('Disconnected socket had no registered userId.');
+            }
         });
 
         // Mobile App - Get All Users (online and offline)
         socket.on('get-online-users', () => {
             const users = clientManager.getAllUsers(); // Returns all users with online status
-            socket.emit('online-users', { users });
+            if (userId) {
+                clientManager.sendToClient(userId, { type: 'online-users', payload: { users } }); // Send to the requesting client
+            }
         });
 
         // Mobile App - Agent Call Ended (with conversation stored)
@@ -158,21 +201,21 @@ export function setupSocketIOServer(io: SocketIOServer): void {
                 await ConversationService.logConversation({
                     callId,
                     recipientId,
-                    callerId: socket.id,
+                    callerId: userId, // Use the stored userId
                     transcript: transcript || '',
                     summary: summary || 'Agent handled call',
                     timestamp: new Date()
                 });
 
                 // Create update for the user
-                const callerUser = clientManager.getUserFromDirectory(socket.id);
+                const callerUser = clientManager.getUserFromDirectory(userId!); // Use the stored userId
                 await UpdatesService.createUpdate({
                     userId: recipientId,
                     type: 'agent-call',
                     title: 'Agent handled call',
                     message: summary || `Agent spoke with ${callerUser?.displayName || 'someone'} while you were unavailable`,
-                    relatedUserId: socket.id,
-                    relatedUserName: callerUser?.displayName || socket.id,
+                    relatedUserId: userId!,
+                    relatedUserName: callerUser?.displayName || userId!,
                     metadata: { callId, transcript, summary }
                 });
 
@@ -199,47 +242,52 @@ export function setupSocketIOServer(io: SocketIOServer): void {
                     const result = await ringUser(to, from, callId, callerName);
 
                     if (!result.success) {
-                        socket.emit('call-failed', { reason: result.reason });
+                        if (userId) { // Send to the caller (current socket's user)
+                            clientManager.sendToClient(userId, {
+                                type: 'call-failed',
+                                payload: { reason: result.reason }
+                            });
+                        }
                     }
                 } else {
                     // Calls blocked → Route to agent
                     logger.info({ callId }, 'Routing to agent (calls blocked)');
 
                     // Construct dynamic agent URL for the client
-                    // Base URL from config + query params for context
-                    // Construct dynamic agent URL for the client
-                    // Base URL from config + query params for context
                     const baseHandlerUrl = config.agentServerUrl;
-
-                    // Construct callback URL for escalation (prefer PUBLIC_URL from env, else fallback to local)
                     const publicUrl = process.env.PUBLIC_URL || `http://${process.env.HOST || '192.168.1.8'}:${config.port}`;
                     const callbackUrl = `${publicUrl}/api/escalate-call`;
-
                     const dynamicAgentUrl = `${baseHandlerUrl}?empid=${to}&calleremp=${from}&callbackUrl=${encodeURIComponent(callbackUrl)}`;
 
                     console.log(`[Signaling] Constructed dynamic agent URL: ${dynamicAgentUrl}`);
 
-                    // Notify caller they're being routed to agent
-                    socket.emit('route-to-agent', {
-                        callId,
-                        recipientId: to,
-                        agentUrl: dynamicAgentUrl,
-                    });
-
-                    // Create proxy to agent server
-                    //removed this socket connection to agent server -28/1
-                    // await AgentProxyService.createProxy(socket, { from, to, callId, callerName });
+                    // Notify caller they\'re being routed to agent
+                    if (userId) { // Send to the caller (current socket's user)
+                        clientManager.sendToClient(userId, {
+                            type: 'route-to-agent',
+                            payload: {
+                                callId,
+                                recipientId: to,
+                                agentUrl: dynamicAgentUrl,
+                            }
+                        });
+                    }
                 }
             } catch (error) {
                 logger.error({ error }, 'Error in call-user handler');
-                socket.emit('call-failed', { reason: 'Internal server error' });
+                if (userId) { // Send to the caller (current socket's user)
+                    clientManager.sendToClient(userId, {
+                        type: 'call-failed',
+                        payload: { reason: 'Internal server error' }
+                    });
+                }
             }
         });
 
-
-
         // Mobile App - Initiate Call (Web / Forced P2P)
         socket.on('call-user-web', async (data: { to: string; from: string; callId: string; callerName: string }) => {
+            // initiateWebCall already uses clientManager.sendToClient internally for call-failed
+            // No change needed here for the caller's socket, as initiateWebCall handles it.
             await initiateWebCall(socket, data);
         });
 
@@ -249,236 +297,27 @@ export function setupSocketIOServer(io: SocketIOServer): void {
 
             logger.info({ from, to, callId }, 'WebRTC offer received from sender');
 
-            // Use getUserFromDirectory for more reliable lookup (works even if socket map is stale)
             const recipient = clientManager.getUserFromDirectory(to);
 
             if (!recipient) {
                 logger.error({ to, from, callId }, 'WebRTC offer FAILED: recipient not found in directory');
-                socket.emit('call-failed', { callId, reason: 'Recipient not found' });
-                if (ack) ack({ success: false, error: 'Recipient not found' });
-                return;
-            }
-
-            if (!recipient.socket) {
-                logger.error({ to, from, callId, isOnline: recipient.isOnline }, 'WebRTC offer FAILED: recipient socket not available');
-                socket.emit('call-failed', { callId, reason: 'Recipient offline or disconnected' });
-                if (ack) ack({ success: false, error: 'Recipient offline' });
-                return;
-            }
-
-            // Forward offer to recipient
-            recipient.socket.emit('webrtc-offer-received', { from, callId, offer });
-            logger.info({ to, from, callId }, 'WebRTC offer successfully forwarded to recipient');
-            if (ack) ack({ success: true });
-        });
-
-        // Mobile App - WebRTC Answer
-        socket.on('webrtc-answer', async (data: { to: string; from: string; callId: string; answer: any }, ack) => {
-            const { to, from, callId, answer } = data;
-
-            logger.info({ from, to, callId }, 'WebRTC answer received from sender');
-
-            const recipient = clientManager.getUserFromDirectory(to);
-
-            if (!recipient) {
-                logger.error({ to, from, callId }, 'WebRTC answer FAILED: recipient not found');
-                socket.emit('call-failed', { callId, reason: 'Recipient not found' });
-                if (ack) ack({ success: false, error: 'Recipient not found' });
-                return;
-            }
-
-            if (!recipient.socket) {
-                logger.error({ to, from, callId }, 'WebRTC answer FAILED: recipient offline');
-                socket.emit('call-failed', { callId, reason: 'Recipient offline' });
-                if (ack) ack({ success: false, error: 'Recipient offline' });
-                return;
-            }
-
-            recipient.socket.emit('webrtc-answer-received', { from, callId, answer });
-            logger.info({ to, from, callId }, 'WebRTC answer successfully forwarded');
-            if (ack) ack({ success: true });
-        });
-
-        // Mobile App - Call Accepted (receiver is ready for offer)
-        socket.on('call-accepted', async (data: { to: string; from: string; callId: string }) => {
-            const { to, from, callId } = data;
-
-            logger.info({ from, to, callId }, 'Call accepted');
-
-            const recipient = clientManager.getMobileUser(to);
-            if (recipient?.socket) {
-                recipient.socket.emit('call-accepted', { from, callId });
-            }
-
-            // Sync: If user answered on one device, stop ringing on their other devices
-            try {
-                const mobileUser = clientManager.getMobileUser(from);
-                const webUser = clientManager.getWebUser(from);
-
-                // If answered on Web (current socket != mobile socket), tell mobile to stop
-                if (mobileUser?.socket && mobileUser.socket.id !== socket.id) {
-                    logger.info({ from, device: 'mobile' }, 'Cancelling call on other device (mobile)');
-                    mobileUser.socket.emit('call-answered-elsewhere', { callId });
+                if (userId) { // Send to the caller (from)
+                    clientManager.sendToClient(userId, {
+                        type: 'call-failed',
+                        payload: { callId, reason: 'Recipient not found' }
+                    });
                 }
-
-                // If answered on Mobile (current socket != web socket), tell web to stop
-                if (webUser?.socket && webUser.socket.id !== socket.id) {
-                    logger.info({ from, device: 'web' }, 'Cancelling call on other device (web)');
-                    webUser.socket.emit('call-answered-elsewhere', { callId });
-                }
-            } catch (error) {
-                logger.error({ error }, 'Error syncing call status across devices');
-            }
-        });
-
-        // Mobile App - ICE Candidate
-        socket.on('webrtc-ice-candidate', async (data: { to: string; from: string; callId: string; candidate: any }, ack) => {
-            const { to, from, callId, candidate } = data;
-
-            logger.info({ from, to, callId, candidateType: candidate?.type }, 'ICE candidate received from sender');
-
-            const recipient = clientManager.getUserFromDirectory(to);
-
-            if (!recipient) {
-                logger.error({ to, from, callId }, 'ICE candidate FAILED: recipient not found - WILL CAUSE ONE-WAY AUDIO');
                 if (ack) ack({ success: false, error: 'Recipient not found' });
                 return;
             }
 
-            if (!recipient.socket) {
-                logger.error({ to, from, callId }, 'ICE candidate FAILED: recipient offline - WILL CAUSE ONE-WAY AUDIO');
-                if (ack) ack({ success: false, error: 'Recipient offline' });
-                return;
-            }
-
-            recipient.socket.emit('webrtc-ice-candidate-received', { from, callId, candidate });
-            logger.info({ to, from, callId, candidateType: candidate?.type }, 'ICE candidate successfully forwarded');
-            if (ack) ack({ success: true });
-        });
-
-        // Mobile App - Reject Call
-        socket.on('reject-call', async (data: { to: string; from: string; callId: string }) => {
-            const { to, from, callId } = data;
-
-            logger.info({ from, to, callId }, 'Mobile call rejected');
-
-            const recipient = clientManager.getMobileUser(to);
-            if (recipient?.socket) {
-                recipient.socket.emit('call-rejected', { from, callId });
-            }
-        });
-
-        // Mobile App - End Call
-        socket.on('end-call', async (data: { to: string; from: string; callId: string }) => {
-            const { to, from, callId } = data;
-
-            logger.info({ from, to, callId }, 'Mobile call ended');
-
-            const recipient = clientManager.getMobileUser(to);
-            if (recipient?.socket) {
-                recipient.socket.emit('call-ended', { from, callId });
-            }
-
-            // Flush and stop whisper transcription for this call
-            WhisperTranscriptionService.stopCall(callId).catch(err => {
-                logger.error({ error: err, callId }, 'Failed to stop whisper for call');
-            });
-        });
-
-        // Mobile App - Send Message
-        socket.on('send-message', async (data: { to: string; from: string; message: string; senderName: string }, ack) => {
-            const { to, from, message, senderName } = data;
-            const messageId = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-            const timestamp = Date.now();
-
-            logger.info({ from, to, messageLength: message.length, messageId }, 'Message send request received');
-
-            const recipient = clientManager.getUserFromDirectory(to);
-
-            if (!recipient) {
-                logger.error({ to, from, messageId }, 'Message FAILED: recipient not found');
-                if (ack) ack({ success: false, error: 'Recipient not found' });
-                return;
-            }
-
-            if (recipient.socket) {
-                // Recipient is online - deliver via WebSocket
-                recipient.socket.emit('receive-message', {
-                    from,
-                    senderName,
-                    message,
-                    messageId,
-                    timestamp,
-                });
-                logger.info({ to, status: 'online', messageId }, 'Message delivered via socket');
-                if (ack) ack({ success: true, delivered: 'socket' });
+            // Forward offer to recipient using sendToClient
+            const sent = clientManager.sendToClient(to, { type: 'webrtc-offer-received', payload: { from, callId, offer } });
+            if (sent) {
+                logger.info({ to, from, callId }, 'WebRTC offer successfully forwarded to recipient');
+                if (ack) ack({ success: true });
             } else {
-                // Recipient offline - log update and send push notification
-                logger.warn({ from, to, messageId }, 'Message sent to offline recipient');
+                logger.error({ to, from, callId }, 'WebRTC offer FAILED: could not forward to recipient');
+                
 
-                // Create missed message update
-                const senderUser = clientManager.getUserFromDirectory(from);
-                await UpdatesService.createUpdate({
-                    userId: to,
-                    type: 'missed-message',
-                    title: 'New message',
-                    message: `${senderUser?.displayName || from}: ${message.substring(0, 50)}${message.length > 50 ? '...' : ''}`,
-                    relatedUserId: from,
-                    relatedUserName: senderUser?.displayName || from,
-                    metadata: { messageId, message }
-                });
-
-                // Send push notification if available
-                if (recipient.fcmToken) {
-                    try {
-                        const { sendMessageNotification } = require('../services/firebaseService');
-                        await sendMessageNotification(
-                            recipient.fcmToken,
-                            from,
-                            senderName,
-                            message,
-                            messageId
-                        );
-                        logger.info({ to, status: 'offline', messageId }, 'Message notification sent via FCM');
-                        if (ack) ack({ success: true, delivered: 'fcm' });
-                    } catch (error) {
-                        logger.error({ error, messageId }, 'Failed to send message notification');
-                        if (ack) ack({ success: false, error: 'FCM delivery failed' });
-                    }
-                } else {
-                    logger.error({ to, status: 'offline', messageId }, 'Message FAILED: recipient offline, no FCM token');
-                    if (ack) ack({ success: false, error: 'Recipient offline and unreachable' });
-                }
-            }
-
-            // Log message to database (regardless of delivery method)
-            try {
-                await ConversationService.logMessage(from, to, message);
-                logger.info({ from, to, messageId }, 'Message logged to database');
-            } catch (error) {
-                logger.error({ error, messageId }, 'Failed to log message to database');
-            }
-        });
-
-        // P2P Audio — stream audio chunks to Whisper for transcription
-        socket.on('p2p-audio', (data: { callId: string; otherUserId: string; audioData: string }) => {
-            if (!userId) return;
-            WhisperTranscriptionService.addAudioChunk(
-                data.callId, userId, data.otherUserId, data.audioData
-            );
-        });
-
-        // Disconnect
-        socket.on('disconnect', () => {
-            if (userId) {
-                clientManager.removeMobileUser(userId);
-                logger.info({ userId }, 'Socket.IO connection closed');
-
-                // Broadcast to all users that this user went offline
-                socket.broadcast.emit('user-disconnected', { userId });
-                // Also emit user-offline for backward compatibility
-                socket.broadcast.emit('user-offline', { userId });
-            }
-        });
-    });
-}
+... [TRUNCATED — file is 24424 chars total]

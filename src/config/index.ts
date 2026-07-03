@@ -9,4 +9,6 @@ export const config = {
     logLevel: process.env.LOG_LEVEL || 'info',
     mongodbUrl: process.env.MONGODB_URL || 'mongodb://localhost:27017/call_gateway',
     agentServerUrl: process.env.AGENT_SERVER_URL || '',
+    jwtSecret: process.env.JWT_SECRET || 'supersecretjwtkey',
+    jwtTokenTtl: parseInt(process.env.JWT_TOKEN_TTL || '3600'),
 };
