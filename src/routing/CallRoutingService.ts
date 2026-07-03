@@ -7,7 +7,7 @@ import { config } from '../config';
 
 const logger = pino({ level: config.logLevel });
 
-export class CallRouter {
+export class CallRoutingService {
     async routeCall(callSession: CallSession): Promise<void> {
         logger.info({ callId: callSession.id }, 'Routing call');
 
@@ -134,4 +134,4 @@ export class CallRouter {
     }
 }
 
-export const callRouter = new CallRouter();
+export const callRoutingService = new CallRoutingService();
