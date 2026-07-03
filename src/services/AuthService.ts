@@ -1,9 +1,9 @@
 import jwt from 'jsonwebtoken';
-import { config, getJwtTokenTtl } from '../config';
+import { config } from '../config';
 
 class AuthService {
     public generateToken(userId: string, ttl?: number): string {
-        const expiresIn = ttl || getJwtTokenTtl();
+        const expiresIn = ttl || config.jwtTokenTtl;
         return jwt.sign({ userId }, config.jwtSecret, { expiresIn });
     }
 
